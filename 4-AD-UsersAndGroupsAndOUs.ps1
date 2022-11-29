@@ -124,6 +124,60 @@ Function AddDelegation($controllee, $controller, $controlleeType, $controllerTyp
             }
     }
 }
+Function PrimaryPath(){
+    Write-Host "Adding Primary Path"
+    $nodeList = @()
+    $EndingNode = get-random -inputobject $EndingNodes
+    $EndingNodes.Remove($EndingNode)
+
+    $FillerNodeCount = get-random 4 -minimum 2
+    for ($i = 0 ; $i -lt $FillerNodeCount; $i++){
+        $itemToAdd = (get-random -inputobject $GenericNodes)
+        $nodeList += $itemToAdd
+
+        #$GenericNodes.remove($itemToAdd)
+        #Update GenericNodes
+        $GenericNodes[$GenericNodes.IndexOf($itemToAdd)].InPath=$True
+    }
+    $nodeList += $EndingNode
+    for ($i = 0; $i -lt $FillerNodeCount; $i++)
+    {
+        $controllee = (get-adobject $nodeList[$i+1].DN -Properties *)
+        $controller = (get-adobject $nodeList[$i].DN -Properties *)
+
+        $controlleeType =  $nodeList[$i+1].Type
+        $controllerType = $nodeList[$i].Type
+
+        AddRandomPrivilege -Controllee $controllee -Controller $controller -ControlleeType $controlleeType  -ControllerType $writerObject.Type
+
+    }
+}
+Function GenericPath(){
+    Write-Host "Adding Generic Path"
+    $nodeList = @()
+    $flexNode =  get-random -inputobject ($GenericNodes |  where-object -property InPath -eq $true)
+
+    $FillerNodeCount = get-random 4 -minimum 2
+    for ($i = 0 ; $i -lt $FillerNodeCount; $i++){
+        $itemToAdd = (get-random -inputobject ($GenericNodes | where-object -property InPath -eq $false))
+        $nodeList += $itemToAdd
+
+        #Update GenericNodes
+        $GenericNodes[$GenericNodes.IndexOf($itemToAdd)].InPath=$True
+    }
+    $nodeList += $flexNode
+    for ($i = 0; $i -lt $FillerNodeCount; $i++)
+    {
+        $controllee = (get-adobject $nodeList[$i+1].DN -Properties *)
+        $controller = (get-adobject $nodeList[$i].DN -Properties *)
+
+        $controlleeType =  $nodeList[$i+1].Type
+        $controllerType = $nodeList[$i].Type
+
+        AddRandomPrivilege -Controllee $controllee -Controller $controller -ControlleeType $controlleeType  -ControllerType $writerObject.Type
+
+    }
+}
 #-------------
 #- Settings  -                                         
 #-------------
@@ -262,57 +316,107 @@ Add-ADGroupMember -Identity "Backup Operators" -Members "Operations"
 ### [TO-DO] Server Admins
 
 
-## Add object ACLs
-### Objects that may have write or be written to
-$potentialWriters = @(
-    (New-Object PSObject -Property @{Type="User";Details=(get-adobject -Filter {objectclass -eq 'user'} -Server ((get-addomain).pdcemulator)| Where-Object { ($_.objectclass -eq "user" -and !@("Guest", "krbtgt", "Administrator").Contains($_.Name)) -and !$_.Name.StartsWith("svc_")})} ),
-    #(New-Object PSObject -Property @{Type="Computers";Details=(get-adobject -Filter {objectclass -eq 'user'} -Server ((get-addomain).pdcemulator)) | Where-Object { ($_.objectclass -eq "Computer") }}) ,
-    (New-Object PSObject -Property @{Type="ServiceAccount";Details=(get-adobject -Filter {objectclass -eq 'user'} -Server ((get-addomain).pdcemulator)) | Where-Object { ($_.objectclass -eq "msDS-GroupManagedServiceAccount" -or (get-adobject $_.distinguishedName).Name.StartsWith("svc_" )) }}) ,
-    (New-Object PSObject -Property @{Type="Group";Details=(get-adobject -Filter {objectclass -eq 'group'} -Server ((get-addomain).pdcemulator) | Where-Object { ($customgroups | where-object -Property RandomACL -eq $True).Name.Contains($_.Name) })} )
-)
-$potentialWritees = @( 
-    (New-Object PSObject -Property @{Type="Domain";Details=(get-adobject -Filter {objectclass -eq 'domain'} -Server ((get-addomain).pdcemulator))}), 
-    (New-Object PSObject -Property @{Type="Computer";Details=(get-adobject -Filter {objectclass -eq 'user'} -Server ((get-addomain).pdcemulator)) | Where-Object { ($_.objectclass -eq "Computer") }}) ,
-    (New-Object PSObject -Property @{Type="User";Details=(get-adobject -Filter {objectclass -eq 'user'} -Server ((get-addomain).pdcemulator) | Where-Object { ($_.objectclass -eq "user" -and $_.name -ne "Guest" -and !$_.name.StartsWith("svc_")) }) }),
-    (New-Object PSObject -Property @{Type="ServiceAccount";Details=(get-adobject -Filter {objectclass -eq 'user'} -Server ((get-addomain).pdcemulator)) | Where-Object { ($_.objectclass -eq "msDS-GroupManagedServiceAccount" -or (get-adobject $_.distinguishedName).Name.StartsWith("svc_" )) }}) ,
-    (New-Object PSObject -Property @{Type="Group";Details=(get-adobject -Filter {objectclass -eq 'group'} -Server ((get-addomain).pdcemulator) | Where-Object { $_.objectclass -eq "group" -and $customgroups.name.Split([Environment]::Newline).Contains($_.Name) -or @("Key Admins", "Enterprise Key Admins","Domain Admins", "Administrators", "Enterprise Admins").Contains($_.Name) }) })
-)
-foreach ($writerObject in $potentialWriters)
+### Generating Generic Nodes
+<# 
+    ---path properties---
+    Length => Length of Path
+    NodeArray => Each Node, with each node having an ACL over the next (except the end)
+
+    There are PrimaryPaths which end in a valuable ndoe (EndingNode), such as DA/equivalent
+    There are GenericPaths which end in a flex node (FlexNode), which are nodes within another path
+
+    ---node properties---
+    Distance => Objects between current position and End + 1; Path.NodeArray.Length-CurrentIndex
+    Type => Object type
+    Membership => What it is a member of
+    InPath => Whether or not this node is in a path. Only used on Generic nodes, as ending nodes are popped from the collective array
+    DN => DistinguishedName
+
+    Ending Nodes are valuable, DA-level objects
+    Flex Nodes are nodes within an existing path
+    GenericNodes are just nodes
+
+#>
+$GenericNodes=[System.Collections.ArrayList]((get-adobject -Properties name,distinguishedname,objectsid,memberof,objectclass -Filter {objectclass -eq 'user'} -Server ((get-addomain).pdcemulator)) | foreach-object {  @{Name=$_.name;Membership=@($((get-adprincipalgroupmembership -identity $_.distinguishedname).name));Distance=0;Type=$_.Objectclass;InPath=$false;DN=$_.DistinguishedName}  } )
+#### Adjusting
+for ($i = 0; $i -lt $GenericNodes.Count; $i++)
 {
-    foreach ($potentialUserWriter in $writerObject.Details)
+    if ((@("$((Get-ADDomainController).name)", "krbtgt", "$((get-addomain).name)").contains($GenericNodes[$i].Name)))
     {
-        $writee = ""
-        $controlleeType = ""
-        $roll = get-random 100 -Minimum 1
-        switch($roll) # Who we are going to write to
+        #Write-Host "Removing"$GenericNodes[$i].Name"from GenericNodes"
+        $GenericNodes.removeAt($i)
+        $i--
+    }
+    if ($GenericNodes[$i].Type -eq "msDS-GroupManagedServiceAccount")
+    {
+        $GenericNodes[$i].Type = "ServiceAccount"
+    }
+    if ($GenericNodes[$i].Membership -is [array])
+    {
+        foreach($group in $GenericNodes[$i].Membership)
         {
-            {$_ -gt 0 -and $_ -le 20} {$writee = get-random -inputobject ($potentialWritees | where-object -property Type -eq "Domain").Details; $controlleeType = "Domain"; break}
-            {$_ -ge 21 -and $_ -le 40} {$writee = get-random -inputobject ($potentialWritees | where-object -property Type -eq "Group").Details ; $controlleeType = "Group"; break}
-            {$_ -ge 41 -and $_ -le 60} {$writee = get-random -inputobject ((($potentialWritees | where-object -property Type -eq "User").Details) | Where-Object -Property Name -ne $writerObject.Details.Name); $controlleeType = "User"; break}
-            {$_ -ge 61 -and $_ -le 80} {$writee = get-random -inputobject ((($potentialWritees | where-object -property Type -eq "Computer").Details) | Where-Object -Property Name -ne $writerObject.Details.Name); $controlleeType = "Computer"; break}
-            {$_ -ge 81 -and $_ -le 100} {$writee = get-random -inputobject ((($potentialWritees | where-object -property Type -eq "ServiceAccount").Details) | Where-Object -Property Name -ne $writerObject.Details.Name); $controlleeType = "ServiceAccount"; break}
-        }
-        if ($writee -ne "")
-        {
-            $controllee = (get-adobject $writee.DistinguishedName -Properties *)
-            $controller = (get-adobject $potentialUserWriter.DistinguishedName -Properties *)
-
-            $controlleeType = $controllee.objectclass
-            $controllerType = $controller.objectclass
-            # Minor Adjustments
-            switch ( $controller.objectclass )
+            if (@("Key Admins", "Enterprise Key Admins","Domain Admins", "Administrators", "Enterprise Admins", "Managers", "Operations").Contains($group))
             {
-                {$_ -eq "msDS-GroupManagedServiceAccount"} { $controllerType = "ServiceAccount"; break;}
-                {$_ -eq "domainDNS"} {$controllerType = "Domain"; break;}
+                #Write-Host "Removing"$GenericNodes[$i].Name"from GenericNodes"
+                $GenericNodes.removeAt($i)
+                $i--
+                break
             }
-            switch ( $controllee.objectclass )
-            {
-                {$_ -eq "msDS-GroupManagedServiceAccount"} { $controlleeType = "ServiceAccount"; break;}
-                {$_ -eq "domainDNS"} {$controlleeType = "Domain"; break;}
-            }
-
-            AddRandomPrivilege -Controllee $controllee -Controller $controller -ControlleeType $controlleeType  -ControllerType $writerObject.Type
         }
     }
+    else
+    {
+        #This never happens
+        echo bruh its not an array this time
+    }
 }
-    
+
+### Generating Ending Nodes
+$EndingNodes=[System.Collections.ArrayList]((get-adobject -Properties name,distinguishedname,objectsid,memberof,objectclass -Filter {objectclass -eq 'user' -or objectclass -eq 'domaindns'} -Server ((get-addomain).pdcemulator)) | foreach-object { if ($_.objectclass -ne 'domaindns') {@{Name=$_.name;Membership=@($((get-adprincipalgroupmembership -identity $_.distinguishedname).name));Distance=0;Type=$_.Objectclass;InPath=$false;DN=$_.DistinguishedName}} else {@{Name=$_.name;Membership=@("");Distance=0;Type="Domain";InPath=$false;DN=$_.DistinguishedName}}   } )
+#### Adjusting
+for ($i = 0; $i -lt $EndingNodes.Count ; $i++ )
+{
+    if ($EndingNodes[$i].Membership -is [array])
+    {
+        if ( ( ((@("Key Admins", "Enterprise Key Admins","Domain Admins", "Administrators", "Enterprise Admins", "Managers", "Operations")) |  Where { $EndingNodes[$i].Membership -contains $_} ) -eq $null) -and (!(@("$((Get-ADDomainController).name)", "krbtgt", "$((get-addomain).name)").contains($EndingNodes[$i].Name))))
+        {
+            #Write-Host "Removing"$EndingNodes[$i].Name"from EndingNodes"
+            $EndingNodes.removeAt($i)
+            $i--
+        }
+    }
+    else
+    {
+        #This never happens
+        echo bruh its not an array this time
+    }
+}
+
+### Create the paths!
+$primaryPathCount = get-random 4 -minimum 2
+
+for ($i = 0; $i -le $primaryPathCount; $i++)
+{
+    if ($EndingNodes.Length -ge 1 -and ($GenericNodes | where-object -Property InPath -eq $false).Length -ge 3)
+    {
+        PrimaryPath
+    }
+    else
+    {
+        break
+    }
+}
+
+$secondaryCount = get-random 4 -minimum 2
+
+for ($i = 0; $i -le $secondaryCount; $i++)
+{
+    if (($GenericNodes | where-object -Property InPath -eq $true).Length -ge 1 -and ($GenericNodes | where-object -Property InPath -eq $false).Length -ge 3)
+    {
+        GenericPath
+    }
+    else
+    {
+        break
+    }
+}
